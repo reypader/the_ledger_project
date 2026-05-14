@@ -1,2 +1,2 @@
 ## AI Plan files
-- add plan wikilinks here
+- [[Phase 1 - Rust - gRPC Scaffolding]]
