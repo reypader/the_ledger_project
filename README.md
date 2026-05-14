@@ -1,10 +1,3 @@
 # The Ledger Project
 
 Inspired by my [borrow_check repository](https://github.com/reypader/borrow_check) which was as a project to start learning Rust but since then I kept thinking about how performance would compare against a Kotlin implementation. I don't think I'll have time to do it all nor would it be productive beyond the novelty of learning the languages. Since Agentic Engineering looks like it's the way forward, I'll dabble in it as well. So, I'll instead create a spec, and have LLMs generate them for me (hopefully with proper guidance and resist the temptation to fully vibe-code it).
-
-## Structure
-
-- `design` is an Obsidian vault containing notes and spec documents
-- `rust` implementation goes here
-- `kotlin` implementation goes here
-- `k6` configuration goes here

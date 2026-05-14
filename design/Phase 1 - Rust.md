@@ -9,4 +9,4 @@
 - Do not directly call `drop()`, instead use block scoping and let Rust drop things as they go out of scope
 
 ## AI Plan files
-- [[2026-05-14-protobuf-definitions]]
+- add plan wikilinks here
