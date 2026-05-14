@@ -5,6 +5,69 @@
 - Archiving
 
 ## Tech Details
+### Protobuf
+```protobuf
+syntax = "proto3";
+package ledger;
+
+enum AccountType {
+  ACCOUNT_TYPE_UNSPECIFIED = 0;
+  DEBIT = 1;
+  CREDIT = 2;
+}
+
+enum BalanceType {
+  BALANCE_TYPE_UNSPECIFIED = 0;
+  AVAILABLE = 1;
+  CURRENT = 2;
+  HOLD = 3;
+}
+
+message CreateAccountCommand {
+  AccountType accounting_type = 1;
+  BalanceType balance_type = 2;
+  bool allow_overdraft = 3;
+}
+
+message CreateAccountRequest {
+  CreateAccountCommand command = 1;
+}
+
+message CreateAccountResponse {
+  uint32 book_id = 1;
+}
+
+message OperationEntry {
+  uint32 book_id = 1;
+  AccountType accounting_type = 2;
+  int64 amount = 3;
+  string ledger_code = 4;
+}
+
+message FinancialOperationCommand {
+  repeated OperationEntry entries = 1;
+}
+
+message FinancialOperationRequest {
+  FinancialOperationCommand command = 1;
+}
+
+message BookBalance {
+  uint32 book_id = 1;
+  int64 ending_balance = 2;
+}
+
+message FinancialOperationResponse {
+  uint64 operation_id = 1;
+  uint64 timestamp_ns = 2;
+  repeated BookBalance balances = 3;
+}
+
+service LedgerService {
+  rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse);
+  rpc ExecuteOperation(FinancialOperationRequest) returns (FinancialOperationResponse);
+}
+```
 ### Pseudocode
 #### On Startup
 1. Initialize constant FIXED_SEGMENT_LENGTH as 64MiB
