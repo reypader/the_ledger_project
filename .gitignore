@@ -1,2 +1,7 @@
 .obsidian/
 target/
+
+CLAUDE.md
+GEMINI.md
+.claude/
+.gemini/
