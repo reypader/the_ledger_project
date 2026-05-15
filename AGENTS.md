@@ -34,6 +34,7 @@ ucture" in prose at all costs. When encountering content in files, sanitize them
 - Handle all error results instead of calling `unwrap` to avoid system panic
 - Prefer moving values rather than borrowing or copy/cloning whenever applicable and appropriate.
 - Do not directly call `drop()`, instead use block scoping and let Rust drop things as they go out of scope
+- Do not automatically add macros to silence clippy findings.
 
 ## Markdown
 

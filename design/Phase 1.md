@@ -87,7 +87,7 @@ service LedgerService {
 
 #### Handlers
 ##### Create Account Request
-1. decode gRPC `create account request`, send corresponding `Create(account_type, balance_type, allow_overdraft)` message to [[#Book Registry Actor]] via its channel
+1. decode gRPC `create account request`, send corresponding `Create(account_type, balance_type, allow_overdraft)` message to [[#Book Manager]] via its channel
 2. wait for response
 
 ##### Financial Operation Request
@@ -99,7 +99,7 @@ service LedgerService {
 	5. The sum of all amounts such that DEBITS are negative and CREDITS are positive must be zero
 2. Preprocess each operation entry as follows:
 	1. Try to fetch each `book_id` from the system book registry. Keep track if which books are missing.
-	2. For each missing book, send a `LoadBook(book_id)` to the [[#Book Registry Actor]] via its channel asynchronously then wait for the resulting `BookState` of each
+	2. For each missing book, send a `LoadBook(book_id)` to the [[#Book Manager]] via its channel asynchronously then wait for the resulting `BookState` of each
 	3. Once all books have been loaded, each entry's amount must be transformed to its `signed_amount` equivalent. If the entry's `accounting_type` does not match the book's `accounting_type` (i.e. DEBIT vs CREDIT), then negate the amount. Accumulate this amount for the corresponding `book_id` as `incoming_total`
 	4. Transform the `ledger_code` string to its equivalent `byte_array`
 	5. Collect an `op[]` array which contains `(signed_amount, ledger_array_bytes)`
@@ -112,7 +112,7 @@ service LedgerService {
 - the acceptor channel is no longer accepting messages
 	- then the handler must immediately return a system failure
 
-#### Book Registry Actor
+#### Book Manager
 ##### Create(accounting_type, balance_type, allow_overdraft)
 1. load `book.id` (create 8-byte file with value 1 if it does not exist).
 2. initialize `book_id` as this value. Increment file value by 1
