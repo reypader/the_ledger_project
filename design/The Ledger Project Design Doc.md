@@ -6,8 +6,15 @@
 5. The `running_balance` of a book cover must always be equal to the sum of each entry starting from offset 0 of segment 1 up to the cover's declared `checkpoint_offset` and `checkpoint_segment`
 6. At the moment of startup, before handling any operation request, all operation journal record must be applied their corresponding book
 7. No two operation journal record can have the same operation_id
-8. Each record of the operation journal must have its operation_id be equal to the previous record's operation_id +1
-9. At most one in-memory instance of each book can exist in the system.
+8. For operation journal, any record N and N+1 must be arranged such that `N.operation_id+1 == (N+1).operation_id`
+9. Similarly, for book journal, any record N and N+1 must be arranged such that `N.operation_id <= (N+1).operation_id && (N.target_segment <= (N+1).target_segment || N.target_offset <= (N+1).target_offset)`
+10. At most one in-memory instance of each BookState can exist in the system. A BookState can only be evicted from memory if no in-flight operation is being processed across all steps.
+
+
+## Scoping Assumptions
+- Any IO error while writing the journal (disk full or otherwise) must immediately shut down the system
+	- Full disk is unrecoverable without manual intervention
+	- The writer must not write out entries out of order to not violate Invariant #8 and so any IO error is essentially unrecoverable
 
 ## Phases
 - [[Phase 1]] - Core functions
