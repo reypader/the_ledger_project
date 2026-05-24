@@ -29,7 +29,7 @@ message CreateAccountResponse {
 }
 
 message OperationEntry {
-  uint32 book_id = 1;
+  uint32 target_book_id = 1;
   AccountType accounting_type = 2;
   // Minor units. Must be > 0. The DEBIT/CREDIT direction of this specific entry is dictated by accounting_type.
   int64 amount = 3;
