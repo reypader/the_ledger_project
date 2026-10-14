@@ -1,29 +1,28 @@
 # The Ledger Project
 
-- non-production ledger system meant as PoC and benchmark between Rust and Kotlin implementations.
+- Non-production ledger system implemented in Rust as a proof of concept.
 - **Use simple and concise language when writing notes.** Assume that the reader is a software engineer with mostly web-development and FinTech experience with limited familiarity with (but is trying to learn) systems-development concepts and low-level jargon.
-- Avoid any sentence structures that set up and then negate or expand beyond expectations (like "X isn't just about Y" or "X is more than just Y" or "X goes beyond Y" or "It's X, not Y"). Avoid these "contrastive str
-ucture" in prose at all costs. When encountering content in files, sanitize them immediately but using direct affirmative sentences. If negation is necessary and unavoidable, elaborate and be specific about it.
+- Avoid any sentence structures that set up and then negate or expand beyond expectations (like "X isn't just about Y" or "X is more than just Y" or "X goes beyond Y" or "It's X, not Y"). Avoid these "contrastive structure" in prose at all costs. When encountering content in files, sanitize them immediately but using direct affirmative sentences. If negation is necessary and unavoidable, elaborate and be specific about it.
 
 ## Folder Structure
 
-- `design` - an Obsidian vault containing notes and spec documents.
-- `rust` - Rust implementation variant goes here
-- `kotlin` - Kotlin implementation variant goes here
-- `k6` - load testing configuration goes here
-- `proto` - protobuf files goes here
+- `design`: An Obsidian vault containing notes and specification documents.
+- `rust`: Rust implementation source code.
+- `k6`: Load testing configuration.
+- `proto`: Protobuf schema files.
 
 ## Plans
 
-- Plans must be scoped into a specific language only.
-- All plan files must be put in the `design` directory and linked to their appropriate `Phase <n> - <language>.md`.
+- All plan files must be placed in the `design` directory and linked to their corresponding `Phase <n> - Rust.md`.
 
 ## Git
 
 - Do not directly commit or push any code to git. This applies to the main agent and any spawned subagent.
 
 ## Rust
-
+- Use `biased;` for `select!` so we can explictly control message priorities in tasks. Typically, shutdown signals go first.
+    - for the `Acceptor`, `Accept` takes precedence over the `flush_timer`
+    - for the `Applier`, provisioning book segments takes precedence over operation segments so operations are backpressured.
 - Use `tokio` for the runtime
 - Use `zerocopy` to define structures to represent file entries
 - Use `thiserror` for error translation and propagation
@@ -35,11 +34,3 @@ ucture" in prose at all costs. When encountering content in files, sanitize them
 - Prefer moving values rather than borrowing or copy/cloning whenever applicable and appropriate.
 - Do not directly call `drop()`, instead use block scoping and let Rust drop things as they go out of scope
 - Do not automatically add macros to silence clippy findings.
-
-## Markdown
-
-- Ignore markdown lint warnings
-
-## Additional context
-
-- When working on code, try to deduce what phase we are working on. If not obvious, ask the user. Once the phase is known, load the corresponding design document in `design/Phase <n>.md`

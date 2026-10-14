@@ -185,9 +185,8 @@ The book registry is owned by the Book Manager but exposed as a shared concurren
 2. Insert the `BookState` into the book registry
 3. if `response_handle` was provided, send an `Ok(BookState)`
 ##### Periodic Registry Eviction
-1. Every `system.cleanup_interval_millis`, scan the registry for any book whose reference count is zero and evict them from the registry
-	- In Rust, this can be done with `Weak<BookState>` on the registry and checking `weak_ref.strong_count() == 0` 
-	- In Kotlin, this can be done with `WeakReference<BookState>` on the registry and checking `weak_ref.get() == null` 
+1. Every `system.cleanup_interval_millis`, scan the registry for any book whose reference count is zero and evict them from the registry.
+	- This can be done with `Weak<BookState>` on the registry and checking `weak_ref.strong_count() == 0`.
 ##### when `shutdown signal` is received
 1. close the book manager channel.
 2. drain the channel and send `Failure(system_shutdown)` through the `response_handle` of each queued `Create` or `LoadBook` that carries one; discard messages without a `response_handle`.

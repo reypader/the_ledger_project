@@ -17,9 +17,7 @@
 	- The writer must not write out entries out of order to not violate Invariant #8 and so any IO error is essentially unrecoverable
 
 ## Phases
-- [[Phase 1]] - Core functions
-	- [[Phase 1 - Rust]]
-	- [[Phase 1 - Kotlin]]
-- [[Phase 2]] - Load Testing Harness
-- [[Phase 3]] - Handler timeout, idempotency, and operation lookup
-- [[Phase 4]] - Kafka variants
+- [[Phase 1]]: Core functions
+- [[Phase 2]]: Load Testing Harness
+- [[Phase 3]]: Handler timeout, idempotency, and operation lookup
+- [[Phase 4]]: Kafka variants
