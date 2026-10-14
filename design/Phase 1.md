@@ -1,5 +1,5 @@
 ## Out of scope
-- Handler timeout, idempotency, and operation lookup
+- Handler timeout, idempotency, and operation lookup (includes the case where the system crashes after an operation is journaled but before its `Accepted` reply reaches the client: recovery applies the operation while the client observed a transport failure)
 - Record security and tampering prevention/detection
 - Currency
 - Archiving
@@ -101,6 +101,7 @@ service LedgerService {
 - Signals take precedent over other messages through ALL channels but do not interrupt processing. A shutdown signal will be processed immediately after the current message has been processed completely.
 - Within the [[#Acceptor]], message precedence is `shutdown signal`, then `Accept`, then `flush_timer`. The `flush_timer` is handled only when no `Accept` is pending and never interrupts an in-progress message.
 - `response_handle?` and similar semantics should be translated to the language's `Optional` semantics
+- A dropped or closed `response_handle` observed while awaiting a response is equivalent to the target actor's channel being closed, and is handled by the awaiting party's System Failure path.
 #### On Startup
 1. Initialize constant FIXED_SEGMENT_LENGTH as 64MiB
 2. Start system tasks and initiate their channels:
@@ -110,17 +111,21 @@ service LedgerService {
 	- Provisioner
 	- Book Manager (initializes its empty book registry `book_id->BookState` on start)
 3. Load the `operation.cov` described in [[#Operation Journal cover]]. Starting from the saved `current_segment=checkpoint_segment` and `current_offset=checkpoint_offset` traverse the operation journal. If the file does not exist, create it with `checkpoint_segment=1` and `checkpoint_offset=0` then system `operation_id_counter=1` as well as `journal.latest_segment=1` and `journal.latest_offset=0`. Send `PreProvisionOperationSegment(1, response_handle) and PreProvisionOperationSegment(2, response_handle)` to [[#Provisioner]] then await. Skip to #5.
-	1. Load the `seg` file corresponding to `current_segment` and jump to `current_offset`
+	1. Load the `seg` file corresponding to `current_segment` and jump to `current_offset`. If this `seg` file does not exist, treat the operation journal as corrupt and trigger a system shutdown; a present cover that references a missing segment is unrecoverable.
 	2. Read the next `2 bytes` which represents the record length. If this is 0 or we've reached EOF, we've reached the end of the segment.
 		1. Verify next segment by loading the `seg` file `current_segment+1` at `offset=0`. Read the next `2 bytes` which represents the record length, if this is 0 or if the segment does not exist, we've reached the end of the journal. Set `journal.latest_segment=current_segment` and `journal.latest_offset=current_offset`. Then determine `operation_id_counter`: try traversing the current segment. If at least one record was read in `current_segment` during this traversal, set `operation_id_counter=last_read_record.operation_id+1`; otherwise (traversal began on an empty `current_segment`), open `current_segment-1` and scan front-to-back, skipping by `record_length`, until `record_length==0`, then set `operation_id_counter=last_record.operation_id+1`; if `current_segment-1==0` (the `000...000.seg` sentinel, meaning no prior segment exists), set `operation_id_counter=1`. Exit the loop and skip to `#5`.
 		2. Otherwise, set `current_segment=current_segment+1` and `current_offset=0` then loop back to `#3.2`
 	3. Read the next `x bytes` where `x` is the `record length-record_length bytes` ([[#Operation Record]]). Collect distinct `operation_record_entry.target_book_id` then send a `LoadBook(target_book_id, response_handle)` for each distinct book to [[#Book Manager]] and await its response. Then, after collecting the returned BookStates, send an `Apply([book_state,...], operation_record, response_handle)` to the [[#Applier]] via its channel asynchronously. Keep that record's `operation_id` in memory then loop back to `#3.2`
-4. Wait for all `response_handle` to finish.
+4. Wait for all `response_handle` to finish. Then send `PreProvisionOperationSegment(journal.latest_segment, response_handle)` and `PreProvisionOperationSegment(journal.latest_segment+1, response_handle)` to the [[#Provisioner]] and await both, so the current and next operation segments exist before the [[#Writer]] runs.
 5. Load the file `book.id` and initialize the system `book_id counter`. If the file does not exist, set the counter to `1` and initialize the file with the value of `1u32`.
 6. Start the gRPC server and begin accepting requests.
 
 #### Shutdown Orchestration
-Runtime receives `SIGTERM`/`SIGINT` and initiates shutdown. The signal propagates in order so each actor stops receiving new work before the next drains: gRPC interface, then [[#Acceptor]], then [[#Writer]], then [[#Applier]], then [[#Book Manager]], then [[#Provisioner]]. Each stage forwards the shutdown signal downstream only after it finishes draining its own channel.
+Runtime receives `SIGTERM`/`SIGINT` and initiates shutdown. The signal propagates in order so each actor stops receiving new work before the next acts: gRPC interface, then [[#Acceptor]], then [[#Writer]], then [[#Applier]], then [[#Book Manager]], then [[#Provisioner]]. Each stage first stops intake (closes its channel, or for gRPC stops accepting new RPCs), then settles its own channel, then forwards the signal downstream. How a stage settles its channel depends on the stage:
+- gRPC lets in-flight RPCs finish.
+- The [[#Acceptor]] and [[#Writer]] drain their channels (and the Acceptor its `write_batch`) and answer every pending `response_handle` with `Failure(system_shutdown)`.
+- The [[#Book Manager]] drains its channel, answering each queued `Create`/`LoadBook` that carries a `response_handle` with `Failure(system_shutdown)` and discarding the rest.
+- The [[#Applier]] and [[#Provisioner]] close their channels and discard queued messages; the Applier relies on startup recovery to re-apply anything it dropped.
 
 #### Handlers
 ##### Create Account Request
@@ -128,13 +133,14 @@ Runtime receives `SIGTERM`/`SIGINT` and initiates shutdown. The signal propagate
 2. wait for response
 3. Transform the result to the appropriate gRPC response:
 	1. `CreateAccountResponse{book_id}`
+4. If the [[#Book Manager]] channel closes or drops the `response_handle` before responding, return gRPC `UNAVAILABLE` (shutdown) or `INTERNAL` (IO or internal failure) per the cause-to-code rule in the Financial Operation [[#System Failure]] section.
 
 ##### Financial Operation Request
 1. decode gRPC `operation request`, validate the request and check its entries. On any validation failure, return a `FinancialOperationResponse{error: OperationError{...}}` with the listed `OperationErrorType` and populated fields; the request must not reach the [[#Acceptor]]:
 	1. All the `book_id` satisfy 0 < `book_id` < system book_id_counter. On failure: `UNKNOWN_BOOK_ID` with `offending_book_id` set to the offending id.
 	2. All `amount` > 0. On failure: `AMOUNT_NOT_POSITIVE` with `offending_book_id` and `offending_entry_index` set to the first offending entry.
 	3. All `ledger_code` are in ASCII and have length between 1 and 8 inclusive. On failure: `INVALID_LEDGER_CODE` with `offending_book_id` and `offending_entry_index` set to the first offending entry.
-	4. The number of entries must be at least 1 and at most 255. On failure: `ENTRY_COUNT_EXCEEDED` with no offending fields. A single-entry operation passes this rule but fails the zero-sum rule below.
+	4. The number of entries must be at least 1 and at most 255. On failure: `ENTRY_COUNT_EXCEEDED` with no offending fields (this code also covers the empty-operation case of fewer than 1 entry). A single-entry operation passes this rule but fails the zero-sum rule below.
 	5. Each entry's `accounting_type` must be `DEBIT` or `CREDIT`. On failure: `INVALID_ACCOUNTING_TYPE` with `offending_book_id` and `offending_entry_index` set to the first offending entry.
 	6. The sum of all amounts such that DEBITS are negative and CREDITS are positive must be zero. On failure: `ZERO_SUM_VIOLATION` with no offending fields. Note that this rule is only for validation. Actual signage is identified by comparing the `accounting_type` of the Book and the operation entries.
 2. Preprocess each operation entry as follows:
@@ -146,23 +152,30 @@ Runtime receives `SIGTERM`/`SIGINT` and initiates shutdown. The signal propagate
 	6. Group the entries with their respective book such that the preprocessing result is `[{book_state, incoming_total, op[]}]`, ordered by each book's first appearance in `command.entries`
 3. Send an `Accept(preprocessing_result, response_handle)` to [[#Acceptor]] via its channel asynchronously then wait for the result.
 4. Transform the result to the appropriate gRPC response:
-	- `Acceptor.Accepted(operation_id, timestamp_ns, ending_balances)` maps to `FinancialOperationResponse{accepted: OperationAccepted{operation_id, timestamp_ns, balances=ending_balances}}`.
+	- `Accepted(operation_id, timestamp_ns, ending_balances)` (sent by the [[#Writer]] through the operation's `response_handle`) maps to `FinancialOperationResponse{accepted: OperationAccepted{operation_id, timestamp_ns, balances=ending_balances}}`.
 	- `Acceptor.Reject(book_id)` maps to `FinancialOperationResponse{error: OperationError{OVERDRAFT_REJECTED, offending_book_id=book_id}}`.
+	- `Failure(system_shutdown)` received through the `response_handle` (from the [[#Acceptor]] or [[#Writer]] drain) maps to gRPC status `UNAVAILABLE`.
 ##### System Failure 
+- An explicit `Failure(system_shutdown)` received through a `response_handle` maps to gRPC status `UNAVAILABLE`.
+- A Book Manager or Acceptor channel that is closed or no longer accepting messages, with no explicit Failure value (dropped handle or unrecoverable internal state), maps to gRPC status `INTERNAL`.
 - when the book manager channel is no longer accepting messages
-	- then the handler must immediately return a system failure
+	- then the handler must immediately return per the rule above
 - the acceptor channel is no longer accepting messages
-	- then the handler must immediately return a system failure
+	- then the handler must immediately return per the rule above
 
 #### Book Manager
+The book registry is owned by the Book Manager but exposed as a shared concurrent map of `Weak<BookState>` that gRPC handlers read directly (Financial Operation step 2.1). Only the Book Manager inserts and evicts.
+
 ##### Create(accounting_type, balance_type, allow_overdraft, response_handle)
 1. load `book_id_counter` . 
-2. Check `book_covers/<first 6 digits of book_id_counter>.cov : Line <last 4 digits of book_id_counter>` if an entry exists. If occupied, increment `book_id_counter` by 1 again since this means there was a system crash between creating the book and #5. Repeat until an empty line is found. Then, initialize with values for [[#Book Journal cover]] as `book.running_balance=0`, `book.accounting_type=accounting_type`, `book.balance_type=balance_type`, `book.allow_overdraft=allow_overdraft`, `book.checkpoint_segment=1`, `book.checkpoint_offset=0`. If file does not exist, create `book_covers/<first 6 digits of book_id_counter>.cov`. Write the initialized values to the cover line, then fsync the cover.
+2. Check `book_covers/<first 6 digits of book_id_counter>.cov : Line <last 4 digits of book_id_counter>` whether the line is occupied. A line is occupied when its 32 bytes are not all zero (an initialized book always has `checkpoint_segment >= 1`); an all-zero line, or a seek beyond the file's current end, counts as empty. If occupied, increment `book_id_counter` by 1 again since this means there was a system crash between creating the book and #5. Repeat until an empty line is found. Then, initialize with values for [[#Book Journal cover]] as `book.running_balance=0`, `book.accounting_type=accounting_type`, `book.balance_type=balance_type`, `book.allow_overdraft=allow_overdraft`, `book.checkpoint_segment=1`, `book.checkpoint_offset=0`. If file does not exist, create `book_covers/<first 6 digits of book_id_counter>.cov`. Write the initialized values to the cover line, then fsync the cover.
 3. send `PreProvisionBookSegment(book_id_counter, 1, response_handle) and PreProvisionBookSegment(book_id_counter, 2, response_handle)` to [[#Provisioner]] via its channel then await both.
 4. Write `book_id_counter+1` to `book.id` as a `u32` (overwrite in place), then fsync. Commit phase after cover and segments are provisioned.
 5. send `LoadBook(book_id_counter++, response_handle)` to self to respond with the created book state.
+
+> Note: a book whose cover was written (step 2) but whose counter was not advanced (crash before step 4) is left initialized and reachable. Its `book_id` is below `book_id_counter`, so it passes validation and `LoadBook` succeeds with a zero balance. This orphaned-but-valid book is accepted behavior; no client holds its id.
 ##### LoadBook(book_id, response_handle)
-1. Re-verify the registry if `book_id` does not yet exist. This is in case multiple `LoadBook` request comes in in sequence. If it does exist, skip to #3.
+1. Re-check the registry for `book_id`. "Exists" means a live (upgradeable) `Weak<BookState>` entry; a dead weak entry counts as missing. This dedups multiple `LoadBook` requests arriving in sequence. If a live entry exists, return it via step 3 and skip the traversal and insert.
 2. Read the `book_covers/<first 6 digits of book_id>.cov : Line <last 4 digits of book_id>` described in [[#Book Journal cover]]. Starting from the saved `current_segment=checkpoint_segment` and `current_offset=checkpoint_offset` traverse the book journal. Inititalize the `BookState` as `book.projected_balance=running_balance`, `book.accounting_type=accounting_type`, `book.balance_type=balance_type`, `book.allow_overdraft=allow_overdraft`, `book.latest_segment=checkpoint_segment`, `book.latest_offset=checkpoint_offset` and `book.id=book_id`.
 	1. Load the `seg` file corresponding to `current_segment` and jump to `current_offset`
 	2. Read the next `2 bytes` which represents the record length. If this is 0 or we've reached EOF, we've reached the end of the segment.
@@ -172,11 +185,12 @@ Runtime receives `SIGTERM`/`SIGINT` and initiates shutdown. The signal propagate
 2. Insert the `BookState` into the book registry
 3. if `response_handle` was provided, send an `Ok(BookState)`
 ##### Periodic Registry Eviction
-1. Every `system.cleanup_interval`, scan the registry for any book whose reference count is zero and evict them from the registry
+1. Every `system.cleanup_interval_millis`, scan the registry for any book whose reference count is zero and evict them from the registry
 	- In Rust, this can be done with `Weak<BookState>` on the registry and checking `weak_ref.strong_count() == 0` 
 	- In Kotlin, this can be done with `WeakReference<BookState>` on the registry and checking `weak_ref.get() == null` 
 ##### when `shutdown signal` is received
-1. close the book manager channel and discard any incoming message.
+1. close the book manager channel.
+2. drain the channel and send `Failure(system_shutdown)` through the `response_handle` of each queued `Create` or `LoadBook` that carries one; discard messages without a `response_handle`.
 ##### System Failure 
 - when the provisioner channel is no longer accepting messages
 	- then the handler must immediately return a system failure
@@ -218,6 +232,7 @@ Runtime receives `SIGTERM`/`SIGINT` and initiates shutdown. The signal propagate
 
 #### Writer
 ##### WriteBatch(write_batch)
+`disk_buffer` is local to a single `WriteBatch` invocation; it starts empty and is not retained across batches. Future optimization: once benchmarks indicate allocation is becoming a bottleneck, `disk_buffer` will be drawn from a reusable object pool and cleared on return to the pool rather than freshly allocated per batch.
 1. Iterate over each `{book_states[], operation_record, response_handle, ending_balances}` of write_batch
 	1. if `size(disk_buffer) + size(operation_record) + journal.latest_offset > FIXED_SEGMENT_LENGTH`, then 
 		1. write `disk_buffer` to `operation_segments/<segment_number first 6 digits>/<journal.latest_segment>.seg` starting at `journal.latest_offset`, then fdatasync the file
@@ -274,10 +289,10 @@ Runtime receives `SIGTERM`/`SIGINT` and initiates shutdown. The signal propagate
 - when the provisioner channel is no longer accepting messages, trigger a system shutdown
 #### Provisioner
 ##### PreProvisionOperationSegment(segment_number, response_handle?)
-1. Create the `operation_segments/<segment_number first 6 digits>` directory if it does not exist. Pre-allocate a `FIXED_SEGMENT_LENGTH` sized, zero-filled file in `operation_segments/<segment_number first 6 digits>/<segment_number>.seg` if the file does not exist. Otherwise, do nothing.
+1. Create the `operation_segments/<segment_number first 6 digits>` directory if it does not exist. Pre-allocate a `FIXED_SEGMENT_LENGTH` sized, zero-filled file in `operation_segments/<segment_number first 6 digits>/<segment_number>.seg` if the file does not exist, or if it exists but is smaller than `FIXED_SEGMENT_LENGTH` (extend it to full size without truncating existing content, zero-filling the added range). If it already exists at full size, do nothing.
 2. if `response_handle` was provided, send an `Ok`
 ##### PreProvisionBookSegment(book_id, segment_number, response_handle?)
-1. Create the parent directory `book_segments/<book_id first 6 digits>/` if it does not exist. Pre-allocate a `FIXED_SEGMENT_LENGTH` sized, zero-filled file in `book_segments/<book_id first 6 digits>/<book_id>-<segment_number>.seg` if the file does not exist. Otherwise, do nothing.
+1. Create the parent directory `book_segments/<book_id first 6 digits>/` if it does not exist. Pre-allocate a `FIXED_SEGMENT_LENGTH` sized, zero-filled file in `book_segments/<book_id first 6 digits>/<book_id>-<segment_number>.seg` if the file does not exist, or if it exists but is smaller than `FIXED_SEGMENT_LENGTH` (extend it to full size without truncating existing content, zero-filling the added range). If it already exists at full size, do nothing.
 2. if `response_handle` was provided, send an `Ok`
 ##### when `shutdown signal` is received
 1. close the provisioner channel and discard any incoming message.
@@ -302,6 +317,7 @@ Journals come in two variants:
 - All covers have a `checkpoint_offset` and `checkpoint_segment` which describes the coordinates for which the rollup has last stopped.
 	- For Books, this describes up to what record the cover's `running_balance` was based on
 	- For Operations, this describes up to what record has been applied to their respective books
+- Position trackers may transiently hold `offset == FIXED_SEGMENT_LENGTH` (the [[#Writer]]'s `journal.latest_offset` and the book cover's `checkpoint_offset`). Only the operation cover is normalized on write (Applier step 6). All readers treat `offset >= FIXED_SEGMENT_LENGTH`, or a zero/EOF record length, as end-of-segment and continue at the next segment, offset 0.
 
 ### Records
 - All records have a a header section which describes the `record_length` that allows readers to quickly skip over records.
@@ -371,6 +387,8 @@ Fixed at 28 bytes.
 
 The proto `OperationEntry.book_id` is the persisted `target_book_id` and the runtime `BookState.id`; they refer to the same value.
 
+The proto `OperationEntry.accounting_type` is consumed during validation and pre-acceptance (it selects the sign of `amount` by comparison with the book's `accounting_type`) and is not persisted; the stored `amount` sign carries the direction.
+
 
 ### Book Journal
 cover filename and line: `book_covers/<first 6 digits of book_state.id>.cov : Line <last 4 digits of book_state.id>`
@@ -387,7 +405,7 @@ segment filename: `book_segments/<book_id first 6 digits>/<u32 book_id>-<u32 seg
 | `checkpoint_segment` | `u32`            | 4     | Segment of the last Book Record position folded into `running_balance`.                                                              |
 | `checkpoint_offset`  | `u32`            | 4     | Offset after the last Book Record position folded into `running_balance`. This describes where to start reading for the next record. |
 
-On-disk line layout (little-endian, fixed 32 bytes per line): `running_balance` (16), `checkpoint_segment` (4), `checkpoint_offset` (4), `balance_type` (1), `accounting_type` (1), `allow_overdraft` (1), then 5 bytes reserved padding.
+On-disk line layout (little-endian, fixed 32 bytes per line): `running_balance` (16), `checkpoint_segment` (4), `checkpoint_offset` (4), `balance_type` (1), `accounting_type` (1), `allow_overdraft` (1), then 5 bytes reserved padding. The `repr(u8)` value of `balance_type` and `accounting_type` equals the corresponding proto enum number (`DEBIT=1`, `CREDIT=2`; `AVAILABLE=1`, `CURRENT=2`, `HOLD=3`).
 
 #### Book Record
 
