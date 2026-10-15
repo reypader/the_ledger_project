@@ -24,7 +24,7 @@
 - Maintain natural byte alignment on zero-copy structures (16-byte alignment for `i128`, 4-byte alignment for `u32`).
 - Compute and verify 4-byte CRC32C checksums using hardware-accelerated CRC32C for all Operation Records and Book Records.
 - Write metadata files atomically using temporary file writes, fsync, atomic rename, and parent directory fsync.
-- Represent account balances as signed 128-bit integers (`i128`). Validate operation entry amounts as unsigned 128-bit integers (`u128`) using checked arithmetic.
+- Represent account balances as signed 128-bit integers (`i128`). Validate operation entry amounts as positive signed 64-bit integers (`1 <= amount <= i64::MAX`) using checked arithmetic.
 - Use `thiserror` for error translation and propagation
 - Use `tonic` (0.14) for receiving gRPC requests
 - Use `prost` (0.14) for protobuf message types

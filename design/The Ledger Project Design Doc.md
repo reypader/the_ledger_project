@@ -1,6 +1,6 @@
 ## Project Invariants
-1. Each accepted operation MUST be zero-sum. The sum of DEBIT amounts equals the sum of CREDIT amounts. Operations with `amount == 0` are rejected. Persisted Journal and Book Records carry only a signed `amount`; the sign is `+` when the write aligns with the target account's natural direction and `−` when it opposes it.
-2. Each Journal Record, Book Record, Operation Index Record MUST be composed of information written in its simplest binary format using the smallest possible data type for the range of its values.
+1. Each accepted operation MUST be zero-sum. The sum of DEBIT amounts equals the sum of CREDIT amounts. Operations with `amount <= 0` or `amount > i64::MAX` are rejected. Persisted Journal and Book Records carry only a signed `amount` represented as `i64`; the sign is `+` when the write aligns with the target account's natural direction and `−` when it opposes it.
+2. Each Journal Record and Book Record MUST maintain natural byte alignment on zero-copy structures, placing multi-byte primitives on natural boundaries with minimal padding.
 3. If a book is flagged as disallowing overdrafts, the final net balance of an accepted operation MUST not put that book into overdraft.
 4. A requested operation MUST only be accepted once it is written to the Operation Journal.
 5. The `running_balance` of a book cover must always be equal to the sum of each entry starting from offset 0 of segment 1 up to the cover's declared `checkpoint_offset` and `checkpoint_segment`.

@@ -23,6 +23,7 @@ enum OperationErrorType {
   AMOUNT_NOT_POSITIVE = 5;
   OVERDRAFT_REJECTED = 6;
   INVALID_ACCOUNTING_TYPE = 7;
+  BALANCE_OVERFLOW = 8;
 }
 
 message CreateAccountCommand {

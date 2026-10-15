@@ -32,6 +32,7 @@ enum OperationErrorType {
   AMOUNT_NOT_POSITIVE = 5;
   OVERDRAFT_REJECTED = 6;
   INVALID_ACCOUNTING_TYPE = 7;
+  BALANCE_OVERFLOW = 8;
 }
 
 message CreateAccountCommand {
@@ -51,7 +52,7 @@ message CreateAccountResponse {
 message OperationEntry {
   uint32 book_id = 1;
   AccountingType accounting_type = 2;
-  int64 amount = 3;
+  int64 amount = 3; // Positive minor units: 1 <= amount <= i64::MAX
   string ledger_code = 4;
 }
 
@@ -113,11 +114,11 @@ service LedgerService {
 3. Load the `operation.cov` described in [[#Operation Journal cover]]. Starting from the saved `current_segment=checkpoint_segment` and `current_offset=checkpoint_offset` traverse the operation journal. If the file does not exist, create it with `checkpoint_segment=1` and `checkpoint_offset=0` then system `operation_id_counter=1` as well as `journal.latest_segment=1` and `journal.latest_offset=0`. Send `PreProvisionOperationSegment(segment_number, response_handle)` to [[#Provisioner]] for each `segment_number` in `1..=1+system.preprovision_lookahead_segments` then await all. Skip to #5.
 	1. Load the `seg` file corresponding to `current_segment` and jump to `current_offset`. If this `seg` file does not exist, treat the operation journal as corrupt and trigger a system shutdown; a present cover that references a missing segment is unrecoverable.
 	2. If `current_offset + 2 > FIXED_SEGMENT_LENGTH`, or if reading the next `2 bytes` encounters EOF or returns 0, we've reached the end of the segment.
-		1. Verify next segment by loading the `seg` file `current_segment+1` at `offset=0`. Read the next `2 bytes` which represents the record length, if this is 0 or if the segment does not exist, we've reached the end of the journal. Set `journal.latest_segment=current_segment` and `journal.latest_offset=current_offset`. Then determine `operation_id_counter`: if at least one record was read in `current_segment` during this traversal, set `operation_id_counter=last_read_record.operation_id+1`. Otherwise, if `current_offset > 0` (meaning records exist in `current_segment` up to `checkpoint_offset`), scan `current_segment` from offset 0 up to `current_offset`, skipping by `record_length`, and set `operation_id_counter=last_record.operation_id+1`. Otherwise (traversal began on an empty `current_segment` with `current_offset == 0`), open `current_segment-1` and scan front-to-back, skipping by `record_length`, until `record_length==0`, then set `operation_id_counter=last_record.operation_id+1`; if `current_segment-1==0` (the `000...000.seg` sentinel, meaning no prior segment exists), set `operation_id_counter=1`. Exit the loop and skip to `#4`.
+		1. Verify next segment by loading the `seg` file `current_segment+1` at `offset=0`. Read the next `2 bytes` which represents the record length, if this is 0 or if the segment does not exist, we've reached the end of the journal. Set `journal.latest_segment=current_segment` and `journal.latest_offset=current_offset`. Then determine `operation_id_counter`: if at least one record was read in `current_segment` during this traversal, set `operation_id_counter=last_read_record.operation_id+1`. Otherwise, if `current_offset > 0` (meaning records exist in `current_segment` up to `checkpoint_offset`), scan `current_segment` from offset 0 up to `current_offset`, skipping by `record_length`, and set `operation_id_counter=last_record.operation_id+1`. Otherwise (traversal began on an empty `current_segment` with `current_offset == 0`), if `current_segment == 1`, set `operation_id_counter=1`; otherwise open `current_segment-1` and scan front-to-back while `scan_offset + 2 <= FIXED_SEGMENT_LENGTH`, skipping by `record_length`, until `record_length==0` or EOF, then set `operation_id_counter=last_record.operation_id+1`. Exit the loop and skip to `#4`.
 		2. Otherwise, set `current_segment=current_segment+1` and `current_offset=0` then loop back to `#3.2`
-	3. Read the next `x bytes` where `x` is the `record length-record_length bytes` ([[#Operation Record]]). Verify the record's `crc32`. If the checksum does not match, treat this as an incomplete write at the journal tip, set `journal.latest_segment=current_segment` and `journal.latest_offset=current_offset`, and break from the traversal loop to `#4`. Otherwise, collect distinct `operation_record_entry.target_book_id` then send a `LoadBook(target_book_id, response_handle)` for each distinct book to [[#Book Manager]] and await its response. Then, after collecting the returned BookStates, send an `Apply([book_state,...], operation_record, response_handle)` to the [[#Applier]] via its channel asynchronously. Keep that record's `operation_id` in memory, advance `current_offset += record_length`, then loop back to `#3.2`.
+	3. Read the next `x bytes` where `x` is the `record length-record_length bytes` ([[#Operation Record]]). Verify the record's `crc32`. If the checksum does not match, inspect the remaining bytes in `current_segment` up to `FIXED_SEGMENT_LENGTH`. If any remaining byte is non-zero, historical journal data is corrupted; trigger an immediate system shutdown. Otherwise, treat this as an incomplete write at the journal tip, set `journal.latest_segment=current_segment` and `journal.latest_offset=current_offset`. Determine `operation_id_counter` using the last valid record read per step 3.2.1, then break from the traversal loop to `#4`. Otherwise, collect distinct `operation_record_entry.target_book_id` then send a `LoadBook(target_book_id, response_handle)` for each distinct book to [[#Book Manager]] and await its response. Then, after collecting the returned BookStates, send an `Apply([book_state,...], operation_record, response_handle)` to the [[#Applier]] via its channel asynchronously. Keep that record's `operation_id` in memory, advance `current_offset += record_length`, then loop back to `#3.2`.
 4. Wait for all `response_handle` to finish, then send a message to [[#Book Manager]] to clear its registry. Then send `PreProvisionOperationSegment(segment_number, response_handle)` for each `segment_number` in `journal.latest_segment..=journal.latest_segment+system.preprovision_lookahead_segments` to the [[#Provisioner]] and await all, so the current and advance operation segments exist before the [[#Writer]] runs.
-5. Load the file `book.id` and initialize the system `book_id counter`. If the file does not exist or contains fewer than 4 bytes, set the counter to `1` and write `1u32` to `book.id` atomically via temporary file replacement.
+5. Load the file `book.id` and initialize the system `book_id counter`. If the file does not exist or contains fewer than 4 bytes, verify whether directory `book_covers/` exists and contains any cover files. If cover files exist, metadata is corrupted; trigger an immediate system shutdown. Otherwise, set the counter to `0` and write `0u32` to `book.id` atomically via temporary file replacement.
 6. Start the gRPC server and begin accepting requests.
 
 #### Shutdown Orchestration
@@ -129,35 +130,36 @@ Runtime receives `SIGTERM`/`SIGINT` and initiates shutdown. The signal propagate
 
 #### Handlers
 ##### Create Account Request
-1. decode gRPC `create account request`. Validate that `accounting_type` is `DEBIT` or `CREDIT` and `balance_type` is `AVAILABLE`, `CURRENT`, or `HOLD`. Reject `UNSPECIFIED` or out-of-range values with gRPC status `INVALID_ARGUMENT`. Then send corresponding `Create(accounting_type, balance_type, allow_overdraft, response_handle)` message to [[#Book Manager]] via its channel
+1. decode gRPC `create account request`. Validate that `command` is present; if unset, reject with gRPC status `INVALID_ARGUMENT`. Validate that `accounting_type` is `DEBIT` or `CREDIT` and `balance_type` is `AVAILABLE`, `CURRENT`, or `HOLD`. Reject `UNSPECIFIED` or out-of-range values with gRPC status `INVALID_ARGUMENT`. Then send corresponding `Create(accounting_type, balance_type, allow_overdraft, response_handle)` message to [[#Book Manager]] via its channel
 2. wait for response
 3. Transform the result to the appropriate gRPC response:
 	1. `CreateAccountResponse{book_id}`
 4. If the [[#Book Manager]] channel closes or drops the `response_handle` before responding, return gRPC `UNAVAILABLE` (shutdown) or `INTERNAL` (IO or internal failure) per the cause-to-code rule in the Financial Operation [[#System Failure]] section.
 
 ##### Financial Operation Request
-1. decode gRPC `operation request`, validate the request and check its entries. On any validation failure, return a `FinancialOperationResponse{error: OperationError{...}}` with the listed `OperationErrorType` and populated fields; the request must not reach the [[#Acceptor]]:
-	1. All the `book_id` satisfy 0 < `book_id` < system book_id_counter. On failure: `UNKNOWN_BOOK_ID` with `offending_book_id` set to the offending id.
-	2. All `amount` > 0. On failure: `AMOUNT_NOT_POSITIVE` with `offending_book_id` and `offending_entry_index` set to the first offending entry.
-	3. All `ledger_code` are in ASCII and have length between 1 and 8 inclusive. On failure: `INVALID_LEDGER_CODE` with `offending_book_id` and `offending_entry_index` set to the first offending entry.
+1. decode gRPC `operation request`. Validate that `command` is present; if unset, reject with gRPC status `INVALID_ARGUMENT`. Validate the request and check its entries. On any validation failure, return a `FinancialOperationResponse{error: OperationError{...}}` with the listed `OperationErrorType` and populated fields; the request must not reach the [[#Acceptor]]:
+	1. All the `book_id` satisfy 0 < `book_id` <= system book_id_counter. On failure: `UNKNOWN_BOOK_ID` with `offending_book_id` set to the offending id.
+	2. All `amount` satisfy 0 < `amount` <= i64::MAX. On failure: `AMOUNT_NOT_POSITIVE` with `offending_book_id` and `offending_entry_index` set to the first offending entry.
+	3. All `ledger_code` are in printable ASCII (`0x21..=0x7E`) and have length between 1 and 8 inclusive. On failure: `INVALID_LEDGER_CODE` with `offending_book_id` and `offending_entry_index` set to the first offending entry.
 	4. The number of entries must be at least 1 and at most 255. On failure: `ENTRY_COUNT_EXCEEDED` with no offending fields (this code also covers the empty-operation case of fewer than 1 entry). A single-entry operation passes this rule but fails the zero-sum rule below.
 	5. Each entry's `accounting_type` must be `DEBIT` or `CREDIT`. On failure: `INVALID_ACCOUNTING_TYPE` with `offending_book_id` and `offending_entry_index` set to the first offending entry.
-	6. Parse each entry's `amount` string as `u128`. Sum all DEBIT amounts and sum all CREDIT amounts separately using checked 128-bit unsigned addition (`u128::checked_add`). On arithmetic overflow or if the total DEBIT amount does not equal the total CREDIT amount, return `ZERO_SUM_VIOLATION` with no offending fields. This check validates financial zero-sum balance before evaluating account signage.
+	6. Sum all DEBIT amounts and sum all CREDIT amounts separately using checked 128-bit unsigned addition (`u128::checked_add`). If the total DEBIT amount does not equal the total CREDIT amount, return `ZERO_SUM_VIOLATION` with no offending fields. This check validates financial zero-sum balance before evaluating account signage.
 2. Preprocess each operation entry as follows:
 	1. Try to fetch each `book_id` from the system book registry. Keep track if which books are missing.
-	2. For each missing book, send a `LoadBook(book_id, response_handle)` to the [[#Book Manager]] via its channel asynchronously then wait for the resulting `BookState` of each. `LoadBook` always returns `Ok(BookState)` for any `book_id` that passed validation step 1.1; any IO failure inside the [[#Book Manager]] triggers a system shutdown and surfaces here as Book Manager channel closure, handled by the [[#System Failure]] path below.
+	2. For each missing book, send a `LoadBook(book_id, response_handle)` to the [[#Book Manager]] via its channel asynchronously then wait for the resulting `BookState` of each. If `LoadBook` returns `BookNotFound` (the account cover line is uninitialized), return `FinancialOperationResponse{error: OperationError{type: UNKNOWN_BOOK_ID, offending_book_id=book_id}}`. Any IO failure inside the [[#Book Manager]] triggers a system shutdown and surfaces here as Book Manager channel closure, handled by the [[#System Failure]] path below.
 	3. Once all books have been loaded, each entry's amount must be transformed to its `signed_amount` equivalent. If the entry's `accounting_type` does not match the book's `accounting_type` (i.e. DEBIT vs CREDIT), then negate the amount. Accumulate this amount for the corresponding `book_id` as `incoming_total`. Widen each amount to `i128` before accumulating such that `incoming_total` is `i128`.
-	4. Transform the `ledger_code` string to its equivalent `byte_array`, left padded with whitespace characters.
+	4. Transform the `ledger_code` string to its equivalent `byte_array`, left padded with ASCII space characters (`0x20`).
 	5. Collect an `op[]` array which contains `(signed_amount, ledger_array_bytes)`
 	6. Group the entries with their respective book such that the preprocessing result is `[{book_state, incoming_total, op[]}]`, ordered by each book's first appearance in `command.entries`
 3. Send an `Accept(preprocessing_result, response_handle)` to [[#Acceptor]] via its channel asynchronously then wait for the result.
 4. Transform the result to the appropriate gRPC response:
 	- `Accepted(operation_id, timestamp_ns, ending_balances)` (sent by the [[#Writer]] through the operation's `response_handle`) maps to `FinancialOperationResponse{accepted: OperationAccepted{operation_id, timestamp_ns, balances=ending_balances}}`.
 	- `Acceptor.Reject(book_id)` maps to `FinancialOperationResponse{error: OperationError{OVERDRAFT_REJECTED, offending_book_id=book_id}}`.
+	- `Acceptor.RejectOverflow(book_id)` maps to `FinancialOperationResponse{error: OperationError{BALANCE_OVERFLOW, offending_book_id=book_id}}`.
 	- `Failure(system_shutdown)` received through the `response_handle` (from the [[#Acceptor]] or [[#Writer]] drain) maps to gRPC status `UNAVAILABLE`.
 ##### System Failure 
 - An explicit `Failure(system_shutdown)` received through a `response_handle` maps to gRPC status `UNAVAILABLE`.
-- A Book Manager or Acceptor channel that is closed or no longer accepting messages, with no explicit Failure value (dropped handle or unrecoverable internal state), maps to gRPC status `INTERNAL`.
+- A Book Manager or Acceptor channel that is closed or no longer accepting messages, with no explicit Failure value (dropped handle or unrecoverable internal state), maps to gRPC status `UNAVAILABLE` if a shutdown signal is active, or `INTERNAL` otherwise.
 - when the book manager channel is no longer accepting messages
 	- then the handler must immediately return per the rule above
 - the acceptor channel is no longer accepting messages
@@ -167,23 +169,23 @@ Runtime receives `SIGTERM`/`SIGINT` and initiates shutdown. The signal propagate
 The book registry is owned by the Book Manager but exposed as a shared concurrent map of `Weak<BookState>` that gRPC handlers read directly (Financial Operation step 2.1). Only the Book Manager inserts and evicts.
 
 ##### Create(accounting_type, balance_type, allow_overdraft, response_handle)
-1. load `book_id_counter` . 
-2. Check `book_covers/<first 6 digits of book_id_counter>.cov : Line <last 4 digits of book_id_counter>` whether the line is occupied. A line is occupied when its 32 bytes are not all zero (an initialized book always has `checkpoint_segment >= 1`); an all-zero line, or a seek beyond the file's current end, counts as empty. If occupied, increment `book_id_counter` by 1 again since this means there was a system crash between creating the book and #5. Repeat until an empty line is found. Then, initialize with values for [[#Book Journal cover]] as `book.running_balance=0`, `book.accounting_type=accounting_type`, `book.balance_type=balance_type`, `book.allow_overdraft=allow_overdraft`, `book.checkpoint_segment=1`, `book.checkpoint_offset=0`. If file does not exist, create `book_covers/<first 6 digits of book_id_counter>.cov`. Write the initialized values to the cover line, then fsync the cover.
-3. send `PreProvisionBookSegment(book_id_counter, segment_number, response_handle)` to [[#Provisioner]] for each `segment_number` in `1..=1+system.preprovision_lookahead_segments` via its channel then await all.
-4. Write `book_id_counter+1` to `book.id.tmp` as a `u32`, fsync `book.id.tmp`, atomically rename `book.id.tmp` to `book.id`, and fsync the parent directory. Commit phase after cover and segments are provisioned.
-5. Execute `LoadBook` logic internally for `book_id_counter++`, register the resulting `BookState`, and return `Ok(BookState)` through `response_handle`.
+1. Let `candidate_id = book_id_counter + 1`.
+2. Ensure directory `book_covers/` exists. Check `book_covers/<first 6 digits of candidate_id>.cov : Line <last 4 digits of candidate_id>` (32-byte slot at offset `(candidate_id % 10000) * 32`) whether the line is occupied. A line is occupied when its 32 bytes are not all zero (an initialized book always has `checkpoint_segment >= 1`); an all-zero line, a seek beyond the file's current end, or a non-existent cover file counts as empty. If occupied, increment `candidate_id` by 1 again to skip past uncommitted slots from prior crashes. Repeat until an empty line is found. Then, initialize with values for [[#Book Journal cover]] as `book.running_balance=0`, `book.accounting_type=accounting_type`, `book.balance_type=balance_type`, `book.allow_overdraft=allow_overdraft`, `book.checkpoint_segment=1`, `book.checkpoint_offset=0`. If file does not exist, create `book_covers/<first 6 digits of candidate_id>.cov`. Write the initialized values to the cover line, then fsync the cover.
+3. send `PreProvisionBookSegment(candidate_id, segment_number, response_handle)` to [[#Provisioner]] for each `segment_number` in `1..=1+system.preprovision_lookahead_segments` via its channel then await all.
+4. Write `candidate_id` to `book.id.tmp` as a `u32`, fsync `book.id.tmp`, atomically rename `book.id.tmp` to `book.id`, and fsync the parent directory. Commit phase after cover and segments are provisioned.
+5. Set `book_id_counter = candidate_id`. Execute `LoadBook` logic internally for `candidate_id`, register the resulting `BookState`, and return `Ok(BookState)` through `response_handle`.
 
-> Note: a book whose cover was written (step 2) but whose counter was not advanced (crash before step 4) is left initialized and reachable. Its `book_id` is below `book_id_counter`, so it passes validation and `LoadBook` succeeds with a zero balance. This orphaned-but-valid book is accepted behavior; no client holds its id.
+> Note: A book whose cover was written (step 2) but whose counter commit was not finished (crash before step 4) remains unreachable because `book_id_counter` was not advanced on disk (`book_id <= book_id_counter` remains false). When a subsequent book is created, collision detection in step 2 skips past any occupied line, preserving slot uniqueness.
 ##### LoadBook(book_id, response_handle)
-1. Re-check the registry for `book_id`. "Exists" means a live (upgradeable) `Weak<BookState>` entry; a dead weak entry counts as missing. This dedups multiple `LoadBook` requests arriving in sequence. If a live entry exists, return it via step 3 and skip the traversal and insert.
-2. Read the `book_covers/<first 6 digits of book_id>.cov : Line <last 4 digits of book_id>` described in [[#Book Journal cover]]. Starting from the saved `current_segment=checkpoint_segment` and `current_offset=checkpoint_offset` traverse the book journal. Inititalize the `BookState` as `book.projected_balance=running_balance`, `book.accounting_type=accounting_type`, `book.balance_type=balance_type`, `book.allow_overdraft=allow_overdraft`, `book.latest_segment=checkpoint_segment`, `book.latest_offset=checkpoint_offset` and `book.id=book_id`.
+1. Re-check the registry for `book_id`. "Exists" means a live (upgradeable) `Weak<BookState>` entry; a dead weak entry counts as missing. This dedups multiple `LoadBook` requests arriving in sequence. If a live entry exists, return it via step 4 and skip the traversal and insert.
+2. Read the `book_covers/<first 6 digits of book_id>.cov : Line <last 4 digits of book_id>` (32-byte slot at offset `(book_id % 10000) * 32`) described in [[#Book Journal cover]]. If the cover file does not exist, or the seek is beyond the end of the file, or all 32 bytes of the slot are zero (`checkpoint_segment == 0`), return `Error(BookNotFound)` through `response_handle` and stop processing. Otherwise, starting from the saved `current_segment=checkpoint_segment` and `current_offset=checkpoint_offset` traverse the book journal. Initialize the `BookState` as `book.projected_balance=running_balance`, `book.accounting_type=accounting_type`, `book.balance_type=balance_type`, `book.allow_overdraft=allow_overdraft`, `book.latest_segment=checkpoint_segment`, `book.latest_offset=checkpoint_offset` and `book.id=book_id`.
 	1. Load the `seg` file corresponding to `current_segment` and jump to `current_offset`
 	2. If `current_offset + 2 > FIXED_SEGMENT_LENGTH`, or if reading the next `2 bytes` encounters EOF or returns 0, we've reached the end of the segment.
-		1. Verify next segment by loading the `seg` file `current_segment+1` at `offset=0`. Read the next `2 bytes` which represents the record length, if this is 0 or if the segment does not exist, we've reached the end of the journal. Initialize `book.latest_segment=current_segment`, `book.latest_offset=current_offset`, then break from the traversal loop and proceed to `#2`.
-		2. Otherwise, set `current_segment=current_segment+1` and `current_offset=0` then loop back to `#1.2`. 
-	3. Read the next `x bytes` where `x` is the record length ([[#Book Record]]). Verify the record's `crc32`. If the checksum does not match, treat this as the end of valid records, initialize `book.latest_segment=current_segment`, `book.latest_offset=current_offset`, then break from the traversal loop and proceed to `#2`. Otherwise, add the record's `amount` to `projected_balance`, set `current_offset += record_length`, then loop back to `#1.2`.
-2. Insert the `BookState` into the book registry
-3. if `response_handle` was provided, send an `Ok(BookState)`
+		1. Verify next segment by loading the `seg` file `current_segment+1` at `offset=0`. Read the next `2 bytes` which represents the record length, if this is 0 or if the segment does not exist, we've reached the end of the journal. Initialize `book.latest_segment=current_segment`, `book.latest_offset=current_offset`, then break from the traversal loop and proceed to `#3`.
+		2. Otherwise, set `current_segment=current_segment+1` and `current_offset=0` then loop back to `#2.2`. 
+	3. Read the next `x bytes` where `x` is the record length ([[#Book Record]]). Verify the record's `crc32`. If the checksum does not match, active journal data is corrupted; trigger an immediate system shutdown. Otherwise, add the record's `amount` to `projected_balance`, set `current_offset += record_length`, then loop back to `#2.2`.
+3. Insert the `BookState` into the book registry
+4. if `response_handle` was provided, send an `Ok(BookState)`
 ##### ClearRegistry
 1. Evict all entries from the book registry.
 ##### Periodic Registry Eviction
@@ -196,23 +198,24 @@ The book registry is owned by the Book Manager but exposed as a shared concurren
 - when the provisioner channel is no longer accepting messages
 	- then the handler must immediately return a system failure
 - when the book manager encounters any IO failure, trigger a system shutdown.
-	- This means full disk or a missing file. A missing file is corruption: Create writes and fsyncs the cover line (step 2) and provisions segments (step 3) before advancing the counter (step 4), so any validated `book_id` already has its cover and segment 1.
+	- This means full disk or an unexpected missing file during `LoadBook` (missing cover files during `Create` are expected and handled by creating the file). Create writes and fsyncs the cover line (step 2) and provisions segments (step 3) before advancing the counter (step 4), so any validated `book_id` already has its cover and segment 1.
 
 #### Acceptor
 ##### Accept(preprocessing_result, response_handle)
 1. initialize `write_batch` with size `write_batch_capacity` if not yet present (typically on the first message after startup).
-2. Validation Pass. Iterate over each `{book_state, incoming_total, op[]}` of preprocessing_result and validate `book_state.allow_overdraft || book_state.projected_balance + incoming_total >= 0 `
-	1. Reject on the first book that fails validation in `preprocessing_result` order, sending a `Reject(book_state.id)` for that book through the operation's `response_handle`, then stop processing the message (short circuit).
+2. Validation Pass. Iterate over each `{book_state, incoming_total, op[]}` of preprocessing_result and compute `let next_balance = book_state.projected_balance.checked_add(incoming_total);`:
+	1. If `next_balance` is `None` (arithmetic overflow beyond `i128`), send `RejectOverflow(book_state.id)` for that book through the operation's `response_handle`, then stop processing the message (short circuit).
+	2. If `next_balance.unwrap() < 0` and `!book_state.allow_overdraft`, send `Reject(book_state.id)` for that book through the operation's `response_handle`, then stop processing the message (short circuit).
 3. Commit Pass. The `projected_balance`, `latest_segment`, and `latest_offset` advances in this pass are optimistic with no rollback. On System failure the system shuts down and discards in-memory state, and recovery rebuilds it from disk. 
 	1. Prepare `timestamp_ns=Timestamp.now().nanoseconds`, `entry_count=sum(op[].size)`, and `operation_id=operation_id counter++`
-	2. Iterate over each `{book_state, incoming_total, op[]}` of preprocessing_result and update `book_state.projected_balance += incoming_total`
+	2. Iterate over each `{book_state, incoming_total, op[]}` of preprocessing_result and update `book_state.projected_balance = book_state.projected_balance.checked_add(incoming_total).expect("validated in pass 1")`
 		1. iterate over each element of `op[]`
 			1. if `FIXED_BOOK_RECORD_SIZE_INCLUDING_RECORD_LENGTH + book_state.latest_offset > FIXED_SEGMENT_LENGTH`, then set `book_state.latest_offset=0`,`book_state.latest_segment++` and send `PreProvisionBookSegment(book_state.id, book_state.latest_segment + i)` for each `i` in `1..=system.preprovision_lookahead_segments` to [[#Provisioner]] via its channel asynchronously as a preemptive provisioning which will be reinforced by [[#Applier]].
 			2. prepare `target_book_id=book_state.id`, `target_segment=book_state.latest_segment`, `target_offset=book_state.latest_offset`, `amount=element.amount`, and `ledger_code=element.ledger_code`
 			3. set `book_state.latest_offset+= FIXED_BOOK_RECORD_SIZE_INCLUDING_RECORD_LENGTH`
 			4. Append the prepared bytes to a temporary `entries` buffer
 		2. collect a map of `book_state.id->ending_balance` 
-	3. Prepare `record_length=size(timestamp_ns)+size(entry_count)+size(operation_id)+size(entries)+size(crc32)+2 bytes (record length)` and the bytes after appending all data in accordance with [[#Operation Record]]
+	3. Prepare `record_length = 48 + entry_count * 32` bytes and the bytes after appending all data in accordance with [[#Operation Record]]
 	4. Prepare a `WriteOperation([book_state,...], operation_record, response_handle, ending_balances)` and append to the `write_batch`
 	5. if this append made `write_batch` size 1 (it was empty before), start the `flush_timer` for `system.flush_timeout_millis`
 	6. if `write_batch` is full, swap the `write_batch` with a new empty array of the same capacity and send `WriteBatch(write_batch)` to [[#Writer]] through its channel. Cancel `flush_timer`.
@@ -262,25 +265,25 @@ The book registry is owned by the Book Manager but exposed as a shared concurren
 
 #### Applier
 ##### Apply(book_states[], operation_record, response_handle)
-1. Validate parity using the Applier's in-memory `checkpoint_segment` and `checkpoint_offset`. The Applier holds these in memory for its lifetime after initializing them from `operation.cov` on its first message and persisting them back to disk in step 7.
+1. Validate parity using the Applier's in-memory `checkpoint_segment` and `checkpoint_offset`. The Applier holds these in memory for its lifetime after initializing them from `operation.cov` on its first message and persisting them back to disk in step 9.
 2. Set `temp_offset=checkpoint_offset` and `temp_segment=checkpoint_segment` then compute `temp_offset + operation_record.record_length`
 	1. if it's `> FIXED_SEGMENT_LENGTH`, set `temp_segment=temp_segment+1` and `temp_offset=0`
 	2. Read `temp_offset to temp_offset+operation_record.record_length` in `operation_segments/<segment_number first 6 digits>/<temp_segment>.seg`, verify its `crc32`, and verify that it contains the exact same `operation_record`; if not, trigger a system shutdown.
 3. check if `book_segments/<target_book_id first 6 digits>/<target_book_id>-<target_segment>.seg` exists for all `operation_entry[]`, if any does not exist, send a `PreProvisionBookSegment(target_book_id, missing_segment, response_handle)` to [[#Provisioner]] via its channel and wait for completion.
 4. Open all `book_segments/<target_book_id first 6 digits>/<target_book_id>-<target_segment>.seg` for writing.
 5. Iterate over the entries of `operation_record` 
-	1. Build the book record: copy `operation_id` and `timestamp_ns` from the `operation_record`, copy `amount` and `ledger_code` from the entry, prepend computed `record_length`, append computed `crc32` (CRC32C). On `book_segments/<target_book_id first 6 digits>/<target_book_id>-<target_segment>.seg`, write the record at `target_offset`.
+	1. Build the book record: copy `operation_id` and `timestamp_ns` from the `operation_record`, copy `amount` and `ledger_code` from the entry, prepend computed `record_length` (64 bytes), append trailing `crc32` (CRC32C computed over preceding 60 bytes). On `book_segments/<target_book_id first 6 digits>/<target_book_id>-<target_segment>.seg`, write the record at `target_offset`.
 6. Call `fdatasync` once on each distinct book segment file written during step 5.
-7. Set `checkpoint_offset=temp_offset+operation_record.record_length` and `checkpoint_segment=temp_segment`. If `checkpoint_offset == FIXED_SEGMENT_LENGTH` (the record ends exactly at the boundary), normalize to `checkpoint_offset=0` and `checkpoint_segment=temp_segment+1`. Write `checkpoint_segment` and `checkpoint_offset` to `operation.cov`, then fsync the file.
-8. For each `book_state` in `book_states[]`
-	1. Read the book cover at `book_covers/<first 6 digits of book_state.id>.cov : Line <last 4 digits of book_state.id>`. Let `book_checkpoint_segment` and `book_checkpoint_offset` denote the cover's `checkpoint_segment` and `checkpoint_offset` (named distinctly from the operation cover's same-named fields used in steps 1 to 7). Starting from `current_segment=book_checkpoint_segment` and `current_offset=book_checkpoint_offset` traverse the book journal. Initialize `rollup_balance` from the cover's `running_balance`.
+7. For each `book_state` in `book_states[]`
+	1. Read the book cover at `book_covers/<first 6 digits of book_state.id>.cov : Line <last 4 digits of book_state.id>`. Let `book_checkpoint_segment` and `book_checkpoint_offset` denote the cover's `checkpoint_segment` and `checkpoint_offset` (named distinctly from the operation cover's same-named fields used in steps 1, 2, and 9). Starting from `current_segment=book_checkpoint_segment` and `current_offset=book_checkpoint_offset` traverse the book journal. Initialize `rollup_balance` from the cover's `running_balance`.
 		1. Load the `seg` file corresponding to `current_segment` and jump to `current_offset`
 		2. If `current_offset + 2 > FIXED_SEGMENT_LENGTH`, or if reading the next `2 bytes` encounters EOF or returns 0, we've reached the end of the segment.
-			1. Verify next segment by loading the `seg` file `current_segment+1` at `offset=0`. Read the next `2 bytes` which represents the record length, if this is 0 or if the segment does not exist, we've reached the end of the journal. Set `book_checkpoint_segment=current_segment`, `book_checkpoint_offset=current_offset`, then break from the traversal loop and proceed to `#8.2`.
-			2. Otherwise, set `current_segment=current_segment+1` and `current_offset=0` then loop back to `#8.1.2` 
-		3. Read the next `x bytes` where `x` is the record length ([[#Book Record]]). Verify the record's `crc32`. If the checksum does not match, treat this as the end of valid records, set `book_checkpoint_segment=current_segment`, `book_checkpoint_offset=current_offset`, then break from the traversal loop and proceed to `#8.2`. Otherwise, add the record's `amount` to `rollup_balance`, set `current_offset += record_length`, then loop back to `#8.1.2`.
+			1. Verify next segment by loading the `seg` file `current_segment+1` at `offset=0`. Read the next `2 bytes` which represents the record length, if this is 0 or if the segment does not exist, we've reached the end of the journal. Set `book_checkpoint_segment=current_segment`, `book_checkpoint_offset=current_offset`, then break from the traversal loop and proceed to `#7.2`.
+			2. Otherwise, set `current_segment=current_segment+1` and `current_offset=0` then loop back to `#7.1.2` 
+		3. Read the next `x bytes` where `x` is the record length ([[#Book Record]]). Verify the record's `crc32`. If the checksum does not match, active journal data is corrupted; trigger an immediate system shutdown. Otherwise, add the record's `amount` to `rollup_balance`, set `current_offset += record_length`, then loop back to `#7.1.2`.
 	2. Write `book_checkpoint_segment` (as `checkpoint_segment`), `book_checkpoint_offset` (as `checkpoint_offset`), and `rollup_balance` (as `running_balance`) to `book_covers/<first 6 digits of book_state.id>.cov : Line <last 4 digits of book_state.id>` while keeping `accounting_type`, `balance_type`, and `allow_overdraft` intact.
-9. Call `fsync` once on each distinct book cover file modified during step 8.
+8. Call `fsync` once on each distinct book cover file modified during step 7.
+9. Set `checkpoint_offset=temp_offset+operation_record.record_length` and `checkpoint_segment=temp_segment`. If `checkpoint_offset == FIXED_SEGMENT_LENGTH` (the record ends exactly at the boundary), normalize to `checkpoint_offset=0` and `checkpoint_segment=temp_segment+1`. Write `checkpoint_segment` and `checkpoint_offset` to `operation.cov.tmp`, fsync `operation.cov.tmp`, atomically rename `operation.cov.tmp` to `operation.cov`, and fsync the parent directory.
 10. if `response_handle` was provided, send an `Ok`
 
 > Note: Future optimization. When benchmarks indicate disk synchronization requires higher throughput, the Applier can drain pending operations from its channel and batch writes across multiple operations in a single group commit, syncing each distinct file once per batch.
@@ -293,17 +296,19 @@ The book registry is owned by the Book Manager but exposed as a shared concurren
 	2. trigger a system shutdown
 - when the provisioner channel is no longer accepting messages, trigger a system shutdown
 #### Provisioner
-##### PreProvisionOperationSegment(segment_number, response_handle?)
-1. Create the `operation_segments/<segment_number first 6 digits>` directory if it does not exist. Pre-allocate a `FIXED_SEGMENT_LENGTH` sized, zero-filled file in `operation_segments/<segment_number first 6 digits>/<segment_number>.seg` if the file does not exist, or if it exists but is smaller than `FIXED_SEGMENT_LENGTH` (extend it to full size without truncating existing content, zero-filling the added range). If it already exists at full size, do nothing.
-2. if `response_handle` was provided, send an `Ok`
+The Provisioner maintains two separate incoming channels: `book_provision_rx` for `PreProvisionBookSegment` and `operation_provision_rx` for `PreProvisionOperationSegment`. In its message loop, the Provisioner uses `tokio::select! { biased; ... }` so `book_provision_rx` takes precedence over `operation_provision_rx`, ensuring operation provisioning is backpressured until pending book segments are provisioned.
+
 ##### PreProvisionBookSegment(book_id, segment_number, response_handle?)
 1. Create the parent directory `book_segments/<book_id first 6 digits>/` if it does not exist. Pre-allocate a `FIXED_SEGMENT_LENGTH` sized, zero-filled file in `book_segments/<book_id first 6 digits>/<book_id>-<segment_number>.seg` if the file does not exist, or if it exists but is smaller than `FIXED_SEGMENT_LENGTH` (extend it to full size without truncating existing content, zero-filling the added range). If it already exists at full size, do nothing.
 2. if `response_handle` was provided, send an `Ok`
+##### PreProvisionOperationSegment(segment_number, response_handle?)
+1. Create the `operation_segments/<segment_number first 6 digits>` directory if it does not exist. Pre-allocate a `FIXED_SEGMENT_LENGTH` sized, zero-filled file in `operation_segments/<segment_number first 6 digits>/<segment_number>.seg` if the file does not exist, or if it exists but is smaller than `FIXED_SEGMENT_LENGTH` (extend it to full size without truncating existing content, zero-filling the added range). If it already exists at full size, do nothing.
+2. if `response_handle` was provided, send an `Ok`
 ##### when `shutdown signal` is received
-1. close the provisioner channel and discard any incoming message.
+1. close both provisioner channels and discard incoming messages.
 ##### System Failure
 - when the provisioner encounters any form of IO error
-	1. close the incoming provisioner channel.
+	1. close incoming provisioner channels.
 	2. trigger a system shutdown
 
 ### Persistent Primitives
@@ -322,7 +327,7 @@ Journals come in two variants:
 - All covers have a `checkpoint_offset` and `checkpoint_segment` which describes the coordinates for which the rollup has last stopped.
 	- For Books, this describes up to what record the cover's `running_balance` was based on
 	- For Operations, this describes up to what record has been applied to their respective books
-- Position trackers may transiently hold `offset == FIXED_SEGMENT_LENGTH` (the [[#Writer]]'s `journal.latest_offset` and the book cover's `checkpoint_offset`). Only the operation cover is normalized on write (Applier step 6). All readers treat `offset >= FIXED_SEGMENT_LENGTH`, or a zero/EOF record length, as end-of-segment and continue at the next segment, offset 0.
+- Position trackers may transiently hold `offset == FIXED_SEGMENT_LENGTH` (the [[#Writer]]'s `journal.latest_offset` and the book cover's `checkpoint_offset`). Only the operation cover is normalized on write (Applier step 9). All readers treat `offset >= FIXED_SEGMENT_LENGTH`, or a zero/EOF record length, as end-of-segment and continue at the next segment, offset 0.
 
 ### Records
 - All records have a a header section which describes the `record_length` that allows readers to quickly skip over records.
@@ -347,7 +352,7 @@ Journals come in two variants:
 | `journal.latest_segment`  | `u32` | Initialized during [[#On Startup]]. Marks where the next operation would be appended. Incremented by the [[#Writer]]          |
 | `cleanup_interval_millis` | `u32` | Eviction scan interval of the book registry. Default to `60000`                                                              |
 | `flush_timeout_millis`    | `u32` | Duration from the first operation when the `write_batch` will be sent to the [[#Writer]] from [[#Acceptor]]. Default to `10` |
-| `book_id_counter`         | `u32` | Initialized during [[#On Startup]]. Incremented by the [[#Book Manager]]                                                      |
+| `book_id_counter`         | `u32` | Initialized during [[#On Startup]]. Incremented by the [[#Book Manager]]. Represents the highest assigned account ID currently active. |
 | `operation_id_counter`    | `u64` | Initialized during [[#On Startup]]. Incremented by the [[#Acceptor]]                                                          |
 | `FIXED_SEGMENT_LENGTH`            | `u32` | Default to `64MiB`                                                                                                           |
 | `write_batch_capacity`            | `u16` | Default to `20`                                                                                                              |
@@ -373,24 +378,27 @@ Fixed at 8 bytes.
 | --------------- | -------------------------------- | ---------------- | ------------------------------------------------------------------------------------------- |
 | `record_length` | `u16`                            | 2                | Total bytes of record including the `record_length`.                                        |
 | `entry_count`   | `u8`                             | 1                | Number of entries in the body. Runtime cap enforced at acceptance.                          |
+| `reserved_0`    | `[u8; 5]`                        | 5                | Reserved padding for 8-byte alignment.                                                      |
 | `operation_id`  | `u64`                            | 8                | Journal sequence assigned at acceptance.                                                    |
-| `timestamp_ns`  | `u128`                           | 16               | Epoch nanoseconds at acceptance.                                                            |
-| `entries`       | `[Operation Entry; entry_count]` | entry_count × 28 | Contiguous fixed-width Operation Entry records, little-endian, no per-entry length prefix.  |
-| `crc32`         | `u32`                            | 4                | CRC32C checksum computed over all preceding bytes of the record.                            |
+| `timestamp_ns`  | `u128`                           | 16               | Epoch nanoseconds at acceptance. Naturally 16-byte aligned.                                  |
+| `entries`       | `[Operation Entry; entry_count]` | entry_count × 32 | Contiguous fixed-width Operation Entry records, little-endian, no per-entry length prefix.  |
+| `reserved_1`    | `[u8; 12]`                       | 12               | Reserved padding for 16-byte alignment and 4-byte CRC alignment.                           |
+| `crc32`         | `u32`                            | 4                | CRC32C checksum computed over all preceding bytes of the record (`0..record_length - 4`).    |
 
-Header is fixed at 27 bytes. Checksum is 4 bytes. Total record is 31 + entry_count × 28 bytes.
+Header is fixed at 32 bytes (`OperationRecordHeader`). Trailer is fixed at 16 bytes (`OperationRecordTrailer`). Total record is 48 + entry_count × 32 bytes. Because Rust dynamically sized types forbid fields trailing an unsized slice, zero-copy deserialization models this record as a fixed header, an entries slice, and a trailer with `crc32` at offset `record_length - 4`.
 
 #### Operation Entry 
 
 | Field            | type      | bytes | Notes                                                                                                              |
 | ---------------- | --------- | ----- | ------------------------------------------------------------------------------------------------------------------ |
-| `target_book_id` | `u32`     | 4     | engine-assigned dense sequence                                                                                     |
-| `target_segment` | `u32`     | 4     | book segment to write on.                                                                                          |
-| `target_offset`  | `u32`     | 4     | segment offset to write on.                                                                                        |
 | `amount`         | `i64`     | 8     | Minor units. Positive when the write aligns with the target book's `accounting_type`; negative when it opposes it. |
 | `ledger_code`    | `[u8; 8]` | 8     | Fixed-width code carried for observability and reconciliation.                                                     |
+| `target_book_id` | `u32`     | 4     | engine-assigned dense sequence.                                                                                    |
+| `target_segment` | `u32`     | 4     | book segment to write on.                                                                                          |
+| `target_offset`  | `u32`     | 4     | segment offset to write on.                                                                                        |
+| `reserved`       | `[u8; 4]` | 4     | Reserved padding for 8-byte and 16-byte alignment.                                                                 |
 
-Fixed at 28 bytes.
+Fixed at 32 bytes.
 
 The proto `OperationEntry.book_id` is the persisted `target_book_id` and the runtime `BookState.id`; they refer to the same value.
 
@@ -408,25 +416,27 @@ segment filename: `book_segments/<book_id first 6 digits>/<u32 book_id>-<u32 seg
 | `running_balance`    | `i128`           | 16    | Signed minor units, natural-direction convention. Must be updated through a overflow-safe addition.                                  |
 | `checkpoint_segment` | `u32`            | 4     | Segment of the last Book Record position folded into `running_balance`.                                                              |
 | `checkpoint_offset`  | `u32`            | 4     | Offset after the last Book Record position folded into `running_balance`. This describes where to start reading for the next record. |
-| `balance_type`       | enum, `repr(u8)` | 1     | This book's balance type. `AVAILABLE`, `CURRENT`, `HOLD`                                                                             |
-| `accounting_type`    | enum, `repr(u8)` | 1     | Natural direction of this book. Fixed at creation. Drives DR/CR-to-signed translation at pre-acceptance. `DEBIT`, `CREDIT`           |
-| `allow_overdraft`    | `bool`           | 1     | Whether this book may be driven negative by an accepted Operation. Fixed at creation.                                                |
+| `balance_type`       | enum, `repr(u8)` | 1     | This book's balance type. `AVAILABLE`, `CURRENT`, `HOLD`. Represented as raw `u8` for `zerocopy` safety.                            |
+| `accounting_type`    | enum, `repr(u8)` | 1     | Natural direction of this book. Fixed at creation. `DEBIT`, `CREDIT`. Represented as raw `u8` for `zerocopy` safety.                 |
+| `allow_overdraft`    | `bool`, `u8`     | 1     | Whether this book may be driven negative by an accepted Operation. Fixed at creation. Stored as raw `u8` (0 or 1).                  |
 | `reserved`           | `[u8; 5]`        | 5     | Reserved padding for 32-byte alignment.                                                                                              |
 
-On-disk line layout (little-endian, fixed 32 bytes per line): `running_balance` (16), `checkpoint_segment` (4), `checkpoint_offset` (4), `balance_type` (1), `accounting_type` (1), `allow_overdraft` (1), then 5 bytes reserved padding. The `repr(u8)` value of `balance_type` and `accounting_type` equals the corresponding proto enum number (`DEBIT=1`, `CREDIT=2`; `AVAILABLE=1`, `CURRENT=2`, `HOLD=3`).
+On-disk line layout (little-endian, fixed 32 bytes per line): `running_balance` (16), `checkpoint_segment` (4), `checkpoint_offset` (4), `balance_type` (1), `accounting_type` (1), `allow_overdraft` (1), then 5 bytes reserved padding. The `repr(u8)` value of `balance_type` and `accounting_type` equals the corresponding proto enum number (`DEBIT=1`, `CREDIT=2`; `AVAILABLE=1`, `CURRENT=2`, `HOLD=3`). For `zerocopy::FromBytes` soundness, single-byte enum and boolean fields are defined as raw `u8` in Rust zero-copy structures.
 
 #### Book Record
 
 | Field           | type      | bytes | Notes                                                                                  |
 | --------------- | --------- | ----- | -------------------------------------------------------------------------------------- |
-| `record_length` | `u16`     | 2     | Total bytes of record including the `record_length`.                                   |
+| `record_length` | `u16`     | 2     | Total bytes of record including the `record_length` (64).                              |
+| `reserved_0`    | `[u8; 6]` | 6     | Reserved padding for 8-byte alignment.                                                 |
 | `operation_id`  | `u64`     | 8     | Journal sequence assigned at acceptance.                                               |
-| `timestamp_ns`  | `u128`    | 16    | Epoch nanoseconds at acceptance.                                                       |
+| `timestamp_ns`  | `u128`    | 16    | Epoch nanoseconds at acceptance. Naturally 16-byte aligned.                             |
 | `amount`        | `i64`     | 8     | Minor units. Sign already encodes direction relative to this book's `accounting_type`. |
 | `ledger_code`   | `[u8; 8]` | 8     | Fixed-width code.                                                                      |
-| `crc32`         | `u32`     | 4     | CRC32C checksum computed over all preceding bytes of the record.                       |
+| `reserved_1`    | `[u8; 12]`| 12    | Reserved padding for 16-byte alignment and 4-byte CRC alignment.                      |
+| `crc32`         | `u32`     | 4     | CRC32C checksum computed over all preceding bytes of the record (`0..60`).              |
 
-Fixed at 46 bytes. `FIXED_BOOK_RECORD_SIZE_INCLUDING_RECORD_LENGTH = 46`.
+Fixed at 64 bytes. `FIXED_BOOK_RECORD_SIZE_INCLUDING_RECORD_LENGTH = 64`.
 
 
 ### Directory Structure
